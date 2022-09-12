@@ -3,7 +3,6 @@
 pragma solidity ^0.8.0;
 
 import "../OFTCore.sol";
-import "./IOFTReceiver.sol";
 import "./IComposableOFTCore.sol";
 import "../../../util/ExcessivelySafeCall.sol";
 
@@ -32,15 +31,21 @@ abstract contract ComposableOFTCore is OFTCore, IComposableOFTCore {
         _sendAndCall(_from, _dstChainId, _toAddress, _amount, _payload, _dstGasForCall, _refundAddress, _zroPaymentAddress, _adapterParams);
     }
 
-    function retryOFTReceived(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes calldata _srcCaller, bytes calldata _from, address _to, uint _amount, bytes calldata _payload) public virtual override {
+    function retryOFTReceived(uint16 _srcChainId, bytes calldata _srcAddress, uint64 _nonce, bytes calldata _from, address _to, uint _amount, bytes calldata _payload) public virtual override {
         bytes32 msgHash = failedOFTReceivedMessages[_srcChainId][_srcAddress][_nonce];
         require(msgHash != bytes32(0), "ComposableOFTCore: no failed message to retry");
 
-        bytes32 hash = keccak256(abi.encode(_srcCaller, _from, _to, _amount, _payload));
+        bytes32 hash = keccak256(abi.encode( _to, _amount, _payload));
         require(hash == msgHash, "ComposableOFTCore: failed message hash mismatch");
 
         delete failedOFTReceivedMessages[_srcChainId][_srcAddress][_nonce];
-        IOFTReceiver(_to).onOFTReceived(_srcChainId, _srcAddress, _nonce, _srcCaller, _from, _amount, _payload);
+
+        (bool success, ) = _to.call(_payload);
+
+        if (success) {
+            _creditTo(_srcChainId, to, amount);
+            emit ReceiveFromChain(_srcChainId, _from, _to, _amount);
+        } else revert();
         emit RetryOFTReceivedSuccess(hash);
     }
 
@@ -71,28 +76,30 @@ abstract contract ComposableOFTCore is OFTCore, IComposableOFTCore {
     }
 
     function _sendAndCallAck(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _payload) internal virtual {
-        (, bytes memory caller, bytes memory from, bytes memory toAddressBytes, uint amount, bytes memory payload, uint gasForCall) = abi.decode(_payload, (uint16, bytes, bytes, bytes, uint, bytes, uint));
+        (, bytes memory from, bytes memory toAddressBytes, uint amount, bytes memory payload, uint gasForCall) = abi.decode(_payload, (uint16, bytes, bytes, uint, bytes, uint));
 
         address to = toAddressBytes.toAddress(0);
-
-        _creditTo(_srcChainId, to, amount);
-        emit ReceiveFromChain(_srcChainId, from, to, amount);
 
         if (!_isContract(to)) {
             emit NonContractAddress(to);
             return;
         }
 
-        _safeCallOnOFTReceived(_srcChainId, _srcAddress, _nonce, caller, from, to, amount, payload, gasForCall);
+        (bool success, ) = _safeCallOnOFTReceived(_srcChainId, _srcAddress, _nonce, to, amount, payload, gasForCall);
+
+        if (success) {
+            _creditTo(_srcChainId, to, amount);
+            emit ReceiveFromChain(_srcChainId, from, to, amount);
+        }
     }
 
-    function _safeCallOnOFTReceived(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, bytes memory _caller, bytes memory _from, address _to, uint _amount, bytes memory _payload, uint _gasForCall) internal virtual {
-        (bool success, bytes memory reason) = _to.excessivelySafeCall(_gasForCall, 150, abi.encodeWithSelector(IOFTReceiver.onOFTReceived.selector, _srcChainId, _srcAddress, _nonce, _caller, _from, _amount, _payload));
+    function _safeCallOnOFTReceived(uint16 _srcChainId, bytes memory _srcAddress, uint64 _nonce, address _to, uint _amount, bytes memory _payload, uint _gasForCall) internal virtual returns (bool success, bytes memory reason) {
+        (success, reason) = _to.excessivelySafeCall(_gasForCall, 150, _payload);
         if (!success) {
-            failedOFTReceivedMessages[_srcChainId][_srcAddress][_nonce] = keccak256(abi.encode(_caller, _from, _to, _amount, _payload));
-            emit CallOFTReceivedFailure(_srcChainId, _srcAddress, _nonce, _caller, _from, _to, _amount, _payload, reason);
+            failedOFTReceivedMessages[_srcChainId][_srcAddress][_nonce] = keccak256(abi.encode(_to, _amount, _payload));
+            emit CallOFTReceivedFailure(_srcChainId, _srcAddress, _nonce, _to, _amount, _payload, reason);
         } else {
-            bytes32 hash = keccak256(abi.encode(_caller, _from, _to, _amount, _payload));
+            bytes32 hash = keccak256(abi.encode( _to, _amount, _payload));
             emit CallOFTReceivedSuccess(_srcChainId, _srcAddress, _nonce, hash);
         }
     }
